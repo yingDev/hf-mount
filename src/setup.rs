@@ -4,9 +4,15 @@ use std::sync::Arc;
 
 use clap::Parser;
 use tracing::info;
+use xet_client::cas_client::{Client as CasClient, MemoryClient, RemoteClient};
+#[cfg(not(target_family = "wasm"))]
+use xet_client::cas_client::LocalClient;
+use xet_client::chunk_cache::{CacheConfig, get_cache};
 use xet_data::processing::configurations::TranslatorConfig;
 use xet_data::processing::data_client::default_config;
-use xet_data::processing::{CacheConfig, FileDownloadSession, create_remote_client, get_cache};
+use xet_data::processing::FileDownloadSession;
+use xet_runtime::config::XetConfig;
+use xet_runtime::core::XetContext;
 
 use crate::cached_xet_client::CachedXetClient;
 use crate::hub_api::{HubApiClient, HubTokenRefresher, SourceKind, parse_repo_id, split_path_prefix};
@@ -340,20 +346,16 @@ pub fn build_with_runtime(
             cache_directory: xorbs_dir,
             cache_size: options.cache_size,
         };
-        Some(get_cache(&config).expect("Failed to create chunk cache"))
+        Some(get_cache(cas_config.ctx.config.as_ref(), &config).expect("Failed to create chunk cache"))
     };
 
-    let raw_client = runtime
-        .block_on(create_remote_client(
-            &cas_config,
-            &uuid::Uuid::new_v4().to_string(),
-            false,
-        ))
-        .expect("Failed to create storage client");
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let raw_client = create_storage_client(&runtime, &cas_config, &session_id);
     let cached_client = CachedXetClient::new(raw_client);
-    let download_session = FileDownloadSession::from_client(cached_client.clone(), None, xorb_cache);
+    let xet_ctx = cas_config.ctx.clone();
+    let download_session = FileDownloadSession::from_client(&xet_ctx, cached_client.clone(), xorb_cache.clone());
     let upload_config = if read_only { None } else { Some(cas_config) };
-    let xet_sessions = XetSessions::new(download_session, upload_config, cached_client);
+    let xet_sessions = XetSessions::new(xet_ctx, download_session, upload_config, cached_client, xorb_cache);
 
     let advanced_writes = options.advanced_writes || (is_nfs && !read_only);
     // Repos need a staging dir for HTTP download cache (open_readonly),
@@ -484,15 +486,52 @@ pub fn raise_fd_limit() {
     }
 }
 
+fn create_storage_client(
+    runtime: &tokio::runtime::Handle,
+    config: &TranslatorConfig,
+    session_id: &str,
+) -> Arc<dyn CasClient> {
+    let session = &config.session;
+
+    if let Some(local_path) = session.local_path(&config.ctx) {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let xorb_path = local_path.join("xet").join("xorbs");
+            return runtime
+                .block_on(LocalClient::new(config.ctx.clone(), xorb_path))
+                .unwrap_or_else(|e| panic!("Failed to create local storage client: {e}"));
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = (local_path, runtime, session_id);
+            unimplemented!("Local file system access is not available in WASM");
+        }
+    }
+
+    if session.is_memory() {
+        return MemoryClient::new(config.ctx.clone());
+    }
+
+    RemoteClient::new(
+        config.ctx.clone(),
+        &session.endpoint,
+        &session.auth,
+        session_id,
+        false,
+        session.custom_headers.clone(),
+    )
+}
+
 fn build_cas_config(runtime: &tokio::runtime::Handle, refresher: &Arc<HubTokenRefresher>) -> Arc<TranslatorConfig> {
     let jwt = runtime
         .block_on(refresher.fetch_initial())
         .unwrap_or_else(|e| panic!("Failed to get storage token: {e}"));
     info!("Got storage token for endpoint: {}", jwt.cas_url);
+    let ctx = XetContext::from_external(runtime.clone(), XetConfig::new());
     Arc::new(
         default_config(
+            &ctx,
             jwt.cas_url,
-            None,
             Some((jwt.access_token, jwt.exp)),
             Some(refresher.clone()),
             None,

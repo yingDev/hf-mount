@@ -2085,19 +2085,23 @@ impl VirtualFs {
         }
 
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
-        if let Some(entry) = inodes.get_mut(ino) {
+        let committed_size = if let Some(entry) = inodes.get_mut(ino) {
+            let size = file_info.file_size().unwrap_or(entry.size);
             entry.apply_commit(
                 file_info.hash(),
-                file_info.file_size(),
+                size,
                 channel.dirty_generation_at_open.load(Ordering::Relaxed),
             );
-        }
+            Some(size)
+        } else {
+            file_info.file_size()
+        };
 
         info!(
             "Committed file: {} (hash={}, size={})",
             full_path,
             file_info.hash(),
-            file_info.file_size(),
+            committed_size.map_or_else(|| "unknown".to_string(), |size| size.to_string()),
         );
 
         Ok(())
