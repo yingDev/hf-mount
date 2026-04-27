@@ -394,7 +394,7 @@ async fn flush_batch(
             item.ino,
             item.full_path,
             file_info.hash(),
-            file_info.file_size().map_or_else(|| "unknown".to_string(), |size| size.to_string())
+            file_info.file_size().expect("upload returned XetFileInfo without size")
         );
         ops.push(BatchOp::AddFile {
             path: item.full_path.clone(),
@@ -414,8 +414,11 @@ async fn flush_batch(
             if unchanged[i]
                 && let Some(entry) = inode_table.get_mut(item.ino)
             {
-                let size = file_info.file_size().unwrap_or(entry.size);
-                entry.apply_commit(file_info.hash(), size, item.dirty_generation);
+                entry.apply_commit(
+                    file_info.hash(),
+                    file_info.file_size().expect("upload returned XetFileInfo without size"),
+                    item.dirty_generation,
+                );
             }
         }
     }
@@ -448,8 +451,11 @@ async fn flush_batch(
             continue;
         }
         if let Some(entry) = inode_table.get_mut(item.ino) {
-            let size = file_info.file_size().unwrap_or(entry.size);
-            entry.apply_commit(file_info.hash(), size, item.dirty_generation);
+            entry.apply_commit(
+                file_info.hash(),
+                file_info.file_size().expect("upload returned XetFileInfo without size"),
+                item.dirty_generation,
+            );
         }
     }
 

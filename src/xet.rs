@@ -58,7 +58,9 @@ pub struct XetSessions {
     upload_config: Option<Arc<TranslatorConfig>>,
     /// Kept separately from `session` for bounded range downloads via `FileReconstructor`.
     cas_client: Arc<dyn Client>,
-    xorb_cache: Option<Arc<dyn ChunkCache>>,
+    /// Chunk cache attached to unbounded streams; bounded range downloads skip it
+    /// to avoid pulling whole xorbs for small range requests.
+    chunk_cache: Option<Arc<dyn ChunkCache>>,
 }
 
 impl XetSessions {
@@ -67,14 +69,14 @@ impl XetSessions {
         session: Arc<FileDownloadSession>,
         upload_config: Option<Arc<TranslatorConfig>>,
         cas_client: Arc<dyn Client>,
-        xorb_cache: Option<Arc<dyn ChunkCache>>,
+        chunk_cache: Option<Arc<dyn ChunkCache>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             ctx,
             session,
             upload_config,
             cas_client,
-            xorb_cache,
+            chunk_cache,
         })
     }
 
@@ -85,19 +87,17 @@ impl XetSessions {
         let hash = file_info
             .merkle_hash()
             .map_err(|e| Error::Xet(format!("invalid hash: {e}")))?;
-
-        let mut reconstructor = FileReconstructor::new(&self.ctx, &self.cas_client, hash);
-
-        if end.is_none()
-            && let Some(cache) = &self.xorb_cache
-        {
+        let is_unbounded = end.is_none();
+        let file_size = file_info.file_size().unwrap_or(u64::MAX);
+        let end = end.unwrap_or(file_size);
+        let mut reconstructor =
+            FileReconstructor::new(&self.ctx, &self.cas_client, hash).with_byte_range(FileRange::new(offset, end));
+        // Attach chunk cache only to the unbounded stream path: the xorb disk
+        // cache pulls full xorbs (~64MB) even for small range requests, which
+        // is wasteful for random reads. Sequential reads (unbounded) benefit.
+        if is_unbounded && let Some(cache) = self.chunk_cache.as_ref() {
             reconstructor = reconstructor.with_chunk_cache(cache.clone());
         }
-
-        if offset > 0 || end.is_some() {
-            reconstructor = reconstructor.with_byte_range(FileRange::new(offset, end.unwrap_or(u64::MAX)));
-        }
-
         Ok(reconstructor.reconstruct_to_stream())
     }
 }
@@ -109,12 +109,8 @@ impl XetOps for XetSessions {
             .upload_config
             .as_ref()
             .ok_or_else(|| Error::hub("no upload config (read-only mode)"))?;
-        let session = FileUploadSession::new(config.clone())
-            .await
-            .map_err(|e| Error::Xet(e.to_string()))?;
-        let (_id, cleaner) = session
-            .start_clean(None, None, Sha256Policy::Skip)
-            .map_err(|e| Error::Xet(e.to_string()))?;
+        let session = FileUploadSession::new(config.clone()).await?;
+        let (_id, cleaner) = session.start_clean(None, None, Sha256Policy::Skip)?;
         Ok(Box::new(StreamingWriter {
             cleaner,
             session,
@@ -124,10 +120,7 @@ impl XetOps for XetSessions {
 
     async fn download_to_file(&self, xet_hash: &str, file_size: u64, dest: &Path) -> Result<()> {
         let file_info = XetFileInfo::new(xet_hash.to_string(), file_size);
-        self.session
-            .download_file(&file_info, dest)
-            .await
-            .map_err(|e| Error::Xet(e.to_string()))?;
+        self.session.download_file(&file_info, dest).await?;
         Ok(())
     }
 
@@ -137,21 +130,12 @@ impl XetOps for XetSessions {
             .as_ref()
             .ok_or_else(|| Error::hub("no upload config (read-only mode)"))?;
 
-        let upload_session = FileUploadSession::new(config.clone())
-            .await
-            .map_err(|e| Error::Xet(e.to_string()))?;
+        let upload_session = FileUploadSession::new(config.clone()).await?;
 
-        let files: Vec<_> = paths
-            .iter()
-            .map(|p| (p.to_path_buf(), Sha256Policy::Skip))
-            .collect();
+        let files: Vec<(PathBuf, Sha256Policy)> = paths.iter().map(|p| (p.to_path_buf(), Sha256Policy::Skip)).collect();
 
-        let results = upload_session
-            .upload_files(files)
-            .await
-            .map_err(|e| Error::Xet(e.to_string()))?;
-
-        upload_session.finalize().await.map_err(|e| Error::Xet(e.to_string()))?;
+        let results = upload_session.upload_files(files).await?;
+        upload_session.finalize().await?;
 
         Ok(results)
     }
@@ -180,7 +164,7 @@ struct DownloadStreamWrapper(DownloadStream);
 #[async_trait::async_trait]
 impl DownloadStreamOps for DownloadStreamWrapper {
     async fn next(&mut self) -> Result<Option<Bytes>> {
-        self.0.next().await.map_err(|e| Error::Xet(e.to_string()))
+        Ok(self.0.next().await?)
     }
 }
 
@@ -275,17 +259,14 @@ pub struct StreamingWriter {
 #[async_trait::async_trait]
 impl StreamingWriterOps for StreamingWriter {
     async fn write(&mut self, data: &[u8]) -> Result<()> {
-        self.cleaner
-            .add_data(data)
-            .await
-            .map_err(|e| Error::Xet(e.to_string()))?;
+        self.cleaner.add_data(data).await?;
         self.bytes_written += data.len() as u64;
         Ok(())
     }
 
     async fn finish_boxed(self: Box<Self>) -> Result<XetFileInfo> {
-        let (info, _metrics) = self.cleaner.finish().await.map_err(|e| Error::Xet(e.to_string()))?;
-        self.session.finalize().await.map_err(|e| Error::Xet(e.to_string()))?;
+        let (info, _metrics) = self.cleaner.finish().await?;
+        self.session.finalize().await?;
         Ok(info)
     }
 

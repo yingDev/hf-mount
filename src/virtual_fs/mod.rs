@@ -25,10 +25,20 @@ use prefetch::{FetchPlan, PrefetchState};
 /// Block size reported in stat(2) for `st_blocks` calculation.
 const BLOCK_SIZE: u32 = 512;
 /// Maximum entries in the negative-lookup cache (parent_path/name → Instant).
-/// Prevents repeated Hub API calls for paths known to not exist.
-const NEG_CACHE_CAPACITY: usize = 10_000;
+/// Prevents repeated Hub API calls for paths known to not exist. Each entry
+/// holds an owned `String` key, so this cache is the dominant cost of the
+/// negative-cache pool. 1k is enough to absorb bursts; older entries roll
+/// over and a real lookup absorbs the cost on miss.
+const NEG_CACHE_CAPACITY: usize = 1_000;
 /// How long a negative-cache entry stays valid before being re-checked.
 const NEG_CACHE_TTL: Duration = Duration::from_secs(30);
+/// `notify_inval_entry` is a blocking syscall that takes the parent dir's
+/// `i_rwsem` in the kernel and walks the dcache. Issuing thousands per sweep
+/// starves concurrent FUSE ops (lookup/readdir wait on the same lock) and
+/// can leave a worker in `D` state for seconds. Cap the batch and pause
+/// between batches so the kernel can drain.
+const INVAL_BATCH_SIZE: usize = 64;
+const INVAL_BATCH_PAUSE: Duration = Duration::from_millis(10);
 
 type InvalidatorFn = Box<dyn Fn(u64) + Send + Sync>;
 /// `(parent, name) -> Ok/Err` maps to `fuse_notify_inval_entry`. Returns
@@ -278,7 +288,7 @@ impl VirtualFs {
             tokio::time::sleep(interval).await;
             let Some(vfs) = weak.upgrade() else { return };
             let table_len = vfs.inode_table.read().expect("inodes poisoned").len();
-            let evicted = vfs.lru_evict_sweep(soft_limit);
+            let evicted = vfs.lru_evict_sweep(soft_limit).await;
             if evicted > 0 || table_len > soft_limit {
                 info!(
                     "lru_sweep: table={} soft_limit={} evicted={}",
@@ -296,7 +306,11 @@ impl VirtualFs {
     /// lets us: when the inode was materialized from a readdir the kernel
     /// never cached a dentry for it (nlookup stays at 0), so no `forget()`
     /// will ever come back. Waiting on one leaks the entry forever.
-    fn lru_evict_sweep(&self, soft_limit: usize) -> usize {
+    ///
+    /// The invalidation loop runs on `spawn_blocking` in chunks of
+    /// `INVAL_BATCH_SIZE` with a `INVAL_BATCH_PAUSE` between chunks so the
+    /// kernel's reverse-notify path doesn't starve concurrent FUSE ops.
+    async fn lru_evict_sweep(&self, soft_limit: usize) -> usize {
         let candidates = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             let len = inodes.len();
@@ -305,18 +319,57 @@ impl VirtualFs {
             }
             inodes.lru_candidates(len - soft_limit)
         };
-        let Some(invalidate_entry) = self.entry_invalidator.get() else {
+        if candidates.is_empty() {
             return 0;
-        };
+        }
+        if self.entry_invalidator.get().is_none() {
+            return 0;
+        }
 
         let mut to_evict = Vec::with_capacity(candidates.len());
-        for (ino, parent, name) in candidates {
-            // `invalidate_entry` returns false when the FUSE notify channel
-            // is saturated (EAGAIN/ENOMEM) — backpressure, stop the sweep.
-            if !invalidate_entry(parent, &name) {
+        let mut iter = candidates.into_iter();
+        loop {
+            let chunk: Vec<(u64, u64, Arc<str>)> = iter.by_ref().take(INVAL_BATCH_SIZE).collect();
+            if chunk.is_empty() {
                 break;
             }
-            to_evict.push(ino);
+            // A short chunk means the iterator was exhausted while filling
+            // it — no need to pause after, there is nothing more to process.
+            let is_last = chunk.len() < INVAL_BATCH_SIZE;
+            let invalidator = self.entry_invalidator.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let Some(invalidate_entry) = invalidator.get() else {
+                    return (Vec::new(), true);
+                };
+                let mut evicted = Vec::with_capacity(chunk.len());
+                for (ino, parent, name) in chunk {
+                    // `invalidate_entry` returns false when the FUSE notify
+                    // channel is saturated (EAGAIN/ENOMEM) — backpressure,
+                    // stop the sweep.
+                    if !invalidate_entry(parent, &name) {
+                        return (evicted, true);
+                    }
+                    evicted.push(ino);
+                }
+                (evicted, false)
+            })
+            .await;
+            let stop = match result {
+                Ok((mut chunk_inos, stop)) => {
+                    to_evict.append(&mut chunk_inos);
+                    stop
+                }
+                Err(e) => {
+                    warn!("lru_sweep: invalidation batch joined with error: {e}");
+                    true
+                }
+            };
+            if stop || is_last {
+                break;
+            }
+            // Pause so the kernel can drain reverse-notify and concurrent
+            // FUSE ops can make progress.
+            tokio::time::sleep(INVAL_BATCH_PAUSE).await;
         }
 
         if to_evict.is_empty() {
@@ -614,7 +667,7 @@ impl VirtualFs {
                 .children
                 .iter()
                 .filter(|c| {
-                    let in_listing = seen_names.contains(&c.name) || seen_dirs.contains(&c.name);
+                    let in_listing = seen_names.contains(&*c.name) || seen_dirs.contains(&*c.name);
                     if in_listing {
                         return false;
                     }
@@ -630,6 +683,10 @@ impl VirtualFs {
         }
 
         if let Some(parent) = inodes.get_mut(parent_ino) {
+            // Vec growth doubles capacity; for a one-shot readdir of a stable
+            // directory we'd otherwise keep ~50% slack forever. Trim now,
+            // since regrowth on rare child mutations is cheap.
+            parent.children.shrink_to_fit();
             parent.children_loaded = true;
         }
         Ok(())
@@ -1182,7 +1239,7 @@ impl VirtualFs {
                 entries.push(VirtualFsDirEntry {
                     ino: child.inode,
                     kind: child.kind,
-                    name: child_ref.name.clone(),
+                    name: child_ref.name.to_string(),
                 });
             }
         }

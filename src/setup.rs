@@ -4,13 +4,10 @@ use std::sync::Arc;
 
 use clap::Parser;
 use tracing::info;
-#[cfg(not(target_family = "wasm"))]
-use xet_client::cas_client::LocalClient;
-use xet_client::cas_client::{Client as CasClient, MemoryClient, RemoteClient};
 use xet_client::chunk_cache::{CacheConfig, CacheEvictionPolicy, get_cache};
-use xet_data::processing::FileDownloadSession;
 use xet_data::processing::configurations::TranslatorConfig;
 use xet_data::processing::data_client::default_config;
+use xet_data::processing::{FileDownloadSession, create_remote_client};
 use xet_runtime::config::XetConfig;
 use xet_runtime::core::XetContext;
 
@@ -248,8 +245,13 @@ pub fn init_tracing(daemon: bool) {
 // ── Build runtime + VFS (spawns threads) ─────────────────────────────
 
 /// Build a multi-threaded tokio runtime suitable for hf-mount.
+///
+/// Async tasks live on the heap, so the per-thread stack only needs to fit
+/// the deepest sync call. 512 KB is ample and shrinks the per-worker virtual
+/// reservation from the 2 MB default.
 pub fn build_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(512 * 1024)
         .enable_all()
         .build()
         .expect("Failed to create tokio runtime")
@@ -355,7 +357,9 @@ pub fn build_with_runtime(
     };
 
     let session_id = uuid::Uuid::new_v4().to_string();
-    let raw_client = create_storage_client(&runtime, &cas_config, &session_id);
+    let raw_client = runtime
+        .block_on(create_remote_client(&cas_config, &session_id, false))
+        .expect("Failed to create storage client");
     let cached_client = CachedXetClient::new(raw_client);
     let xet_ctx = cas_config.ctx.clone();
     let effective_cache_policy = cas_config.ctx.config.chunk_cache.eviction_policy.to_string();
@@ -491,42 +495,6 @@ pub fn raise_fd_limit() {
     if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) } != 0 {
         eprintln!("warning: failed to raise file descriptor limit to {TARGET_NOFILE}");
     }
-}
-
-fn create_storage_client(
-    runtime: &tokio::runtime::Handle,
-    config: &TranslatorConfig,
-    session_id: &str,
-) -> Arc<dyn CasClient> {
-    let session = &config.session;
-
-    if let Some(local_path) = session.local_path(&config.ctx) {
-        #[cfg(not(target_family = "wasm"))]
-        {
-            let xorb_path = local_path.join("xet").join("xorbs");
-            return runtime
-                .block_on(LocalClient::new(config.ctx.clone(), xorb_path))
-                .unwrap_or_else(|e| panic!("Failed to create local storage client: {e}"));
-        }
-        #[cfg(target_family = "wasm")]
-        {
-            let _ = (local_path, runtime, session_id);
-            unimplemented!("Local file system access is not available in WASM");
-        }
-    }
-
-    if session.is_memory() {
-        return MemoryClient::new(config.ctx.clone());
-    }
-
-    RemoteClient::new(
-        config.ctx.clone(),
-        &session.endpoint,
-        &session.auth,
-        session_id,
-        false,
-        session.custom_headers.clone(),
-    )
 }
 
 fn build_cas_config(
