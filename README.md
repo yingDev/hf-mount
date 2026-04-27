@@ -213,6 +213,7 @@ hf-mount stop /tmp/data          # daemon mounts
 | `--hub-endpoint` | `https://huggingface.co` | Hub API endpoint |
 | `--cache-dir` | `/tmp/hf-mount-cache` | Local cache directory |
 | `--cache-size` | `10000000000` (~10 GB) | Max on-disk chunk cache size in bytes |
+| `--cache-policy` | `random` | On-disk chunk cache eviction policy: `random`, `lru`, or `lfu` |
 | `--read-only` | `false` | Mount read-only (always on for repos) |
 | `--advanced-writes` | `false` | Enable staging files + async flush (random writes, seek, overwrite) |
 | `--poll-interval-secs` | `30` | Remote change polling interval (0 to disable) |

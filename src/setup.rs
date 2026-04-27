@@ -4,13 +4,13 @@ use std::sync::Arc;
 
 use clap::Parser;
 use tracing::info;
-use xet_client::cas_client::{Client as CasClient, MemoryClient, RemoteClient};
 #[cfg(not(target_family = "wasm"))]
 use xet_client::cas_client::LocalClient;
-use xet_client::chunk_cache::{CacheConfig, get_cache};
+use xet_client::cas_client::{Client as CasClient, MemoryClient, RemoteClient};
+use xet_client::chunk_cache::{CacheConfig, CacheEvictionPolicy, get_cache};
+use xet_data::processing::FileDownloadSession;
 use xet_data::processing::configurations::TranslatorConfig;
 use xet_data::processing::data_client::default_config;
-use xet_data::processing::FileDownloadSession;
 use xet_runtime::config::XetConfig;
 use xet_runtime::core::XetContext;
 
@@ -106,6 +106,11 @@ pub struct MountOptions {
     /// Maximum size in bytes for the on-disk chunk cache.
     #[arg(long, default_value_t = 10_000_000_000)]
     pub cache_size: u64,
+
+    /// Eviction policy for the on-disk chunk cache. Valid values: random, lru, lfu.
+    /// Defaults to HF_XET_CHUNK_CACHE_EVICTION_POLICY or random.
+    #[arg(long, value_name = "POLICY")]
+    pub cache_policy: Option<CacheEvictionPolicy>,
 
     /// Disable the on-disk chunk cache. Every read fetches data from
     /// HF storage (no local disk caching between reads). Useful for
@@ -330,7 +335,7 @@ pub fn build_with_runtime(
     }
 
     let refresher = hub_client.token_refresher(read_only);
-    let cas_config = build_cas_config(&runtime, &refresher);
+    let cas_config = build_cas_config(&runtime, &refresher, options.cache_policy);
 
     // Ensure cache directory exists and is writable (needed for staging even without chunk cache).
     std::fs::create_dir_all(&options.cache_dir)
@@ -353,6 +358,7 @@ pub fn build_with_runtime(
     let raw_client = create_storage_client(&runtime, &cas_config, &session_id);
     let cached_client = CachedXetClient::new(raw_client);
     let xet_ctx = cas_config.ctx.clone();
+    let effective_cache_policy = cas_config.ctx.config.chunk_cache.eviction_policy.to_string();
     let download_session = FileDownloadSession::from_client(&xet_ctx, cached_client.clone(), xorb_cache.clone());
     let upload_config = if read_only { None } else { Some(cas_config) };
     let xet_sessions = XetSessions::new(xet_ctx, download_session, upload_config, cached_client, xorb_cache);
@@ -397,7 +403,7 @@ pub fn build_with_runtime(
     );
     info!(
         "Config: advanced_writes={} direct_io={} poll_interval={}s metadata_ttl={}ms \
-         cache_dir={:?} cache_size={} no_disk_cache={} max_threads={} \
+         cache_dir={:?} cache_size={} cache_policy={} no_disk_cache={} max_threads={} \
          flush_debounce={}ms flush_max_batch={}ms uid={} gid={} filter_os_files={}",
         advanced_writes,
         options.direct_io,
@@ -405,6 +411,7 @@ pub fn build_with_runtime(
         options.metadata_ttl_ms,
         options.cache_dir,
         options.cache_size,
+        effective_cache_policy,
         options.no_disk_cache,
         options.max_threads,
         options.flush_debounce_ms,
@@ -522,12 +529,22 @@ fn create_storage_client(
     )
 }
 
-fn build_cas_config(runtime: &tokio::runtime::Handle, refresher: &Arc<HubTokenRefresher>) -> Arc<TranslatorConfig> {
+fn build_cas_config(
+    runtime: &tokio::runtime::Handle,
+    refresher: &Arc<HubTokenRefresher>,
+    cache_policy: Option<CacheEvictionPolicy>,
+) -> Arc<TranslatorConfig> {
     let jwt = runtime
         .block_on(refresher.fetch_initial())
         .unwrap_or_else(|e| panic!("Failed to get storage token: {e}"));
     info!("Got storage token for endpoint: {}", jwt.cas_url);
-    let ctx = XetContext::from_external(runtime.clone(), XetConfig::new());
+    let mut xet_config = XetConfig::new();
+    if let Some(cache_policy) = cache_policy {
+        xet_config = xet_config
+            .with_config("chunk_cache.eviction_policy", cache_policy)
+            .unwrap_or_else(|e| panic!("Failed to set chunk cache policy {cache_policy}: {e}"));
+    }
+    let ctx = XetContext::from_external(runtime.clone(), xet_config);
     Arc::new(
         default_config(
             &ctx,
@@ -538,4 +555,43 @@ fn build_cas_config(runtime: &tokio::runtime::Handle, refresher: &Arc<HubTokenRe
         )
         .unwrap_or_else(|e| panic!("Failed to build TranslatorConfig: {e}")),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    use super::*;
+
+    #[test]
+    fn parses_cache_policy() {
+        let args = Args::try_parse_from([
+            "hf-mount-fuse",
+            "--cache-policy",
+            "lru",
+            "bucket",
+            "user/my-bucket",
+            "/tmp/hf-mount-test",
+        ])
+        .expect("valid cache policy should parse");
+
+        assert_eq!(args.options.cache_policy, Some(CacheEvictionPolicy::Lru));
+    }
+
+    #[test]
+    fn rejects_unknown_cache_policy() {
+        let err = match Args::try_parse_from([
+            "hf-mount-fuse",
+            "--cache-policy",
+            "fifo",
+            "bucket",
+            "user/my-bucket",
+            "/tmp/hf-mount-test",
+        ]) {
+            Ok(_) => panic!("unknown cache policy should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("unknown chunk cache eviction policy"));
+    }
 }
