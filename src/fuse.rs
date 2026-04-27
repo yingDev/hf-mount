@@ -593,15 +593,17 @@ pub fn mount_fuse(
     daemon_guard: Option<&mut DaemonGuard>,
     fuse_fds: Vec<OwnedFd>,
 ) -> Result<FuseSession, io::Error> {
-    let adapter = FuseAdapter::new(
-        setup.runtime.clone(),
-        setup.virtual_fs.clone(),
-        setup.metadata_ttl,
-        setup.read_only,
-        setup.advanced_writes,
-        setup.direct_io,
-    );
     let mount_point = &setup.mount_point;
+    let make_adapter = || {
+        FuseAdapter::new(
+            setup.runtime.clone(),
+            setup.virtual_fs.clone(),
+            setup.metadata_ttl,
+            setup.read_only,
+            setup.advanced_writes,
+            setup.direct_io,
+        )
+    };
 
     let mut config = fuser::Config::default();
     config.mount_options = vec![
@@ -649,15 +651,20 @@ pub fn mount_fuse(
     }
 
     let session = if fuse_fds.is_empty() {
-        fuser::Session::new(adapter, mount_point, &config).inspect_err(|e| {
-            if e.kind() == io::ErrorKind::PermissionDenied {
-                error!(
-                    "Permission denied: mounting a FUSE filesystem requires root privileges. \
-                     Try running with: sudo {}",
-                    std::env::args().collect::<Vec<_>>().join(" ")
+        match fuser::Session::new(make_adapter(), mount_point, &config).inspect_err(log_fuse_mount_error) {
+            Ok(session) => session,
+            Err(err) if err.raw_os_error() == Some(libc::ENOTCONN) => {
+                warn!(
+                    "Mount point {:?} appears to be a disconnected FUSE mount; attempting lazy unmount before retry",
+                    mount_point
                 );
+                if !unmount_fuse(mount_point) {
+                    return Err(err);
+                }
+                fuser::Session::new(make_adapter(), mount_point, &config).inspect_err(log_fuse_mount_error)?
             }
-        })?
+            Err(err) => return Err(err),
+        }
     } else {
         let mut fds = fuse_fds.into_iter();
         let primary = fds.next().expect("non-empty checked above");
@@ -667,7 +674,7 @@ pub fn mount_fuse(
             primary,
             extras.len()
         );
-        fuser::Session::from_fds(adapter, primary, extras, config.acl, config)?
+        fuser::Session::from_fds(make_adapter(), primary, extras, config.acl, config)?
     };
     let notifier = session.notifier();
     let notifier_for_inode = notifier.clone();
@@ -709,6 +716,16 @@ pub fn mount_fuse(
         mount_point: mount_point.to_path_buf(),
         runtime: setup.runtime.clone(),
     })
+}
+
+fn log_fuse_mount_error(e: &io::Error) {
+    if e.kind() == io::ErrorKind::PermissionDenied {
+        error!(
+            "Permission denied: mounting a FUSE filesystem requires root privileges. \
+             Try running with: sudo {}",
+            std::env::args().collect::<Vec<_>>().join(" ")
+        );
+    }
 }
 
 /// Wait for SIGINT, SIGTERM, or SIGHUP.

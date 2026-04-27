@@ -296,7 +296,7 @@ pub fn mount_bucket(bucket_id: &str, mount_point: &str, cache_dir: &str, extra_a
     std::fs::create_dir_all(cache_dir).ok();
 
     let ep = endpoint();
-    let child = Command::new(binary)
+    let mut child = Command::new(binary)
         .env(
             "RUST_LOG",
             std::env::var("RUST_LOG").unwrap_or_else(|_| "hf_mount=warn".to_string()),
@@ -316,17 +316,7 @@ pub fn mount_bucket(bucket_id: &str, mount_point: &str, cache_dir: &str, extra_a
         .spawn()
         .expect("Failed to spawn hf-mount-fuse");
 
-    for i in 0..30 {
-        std::thread::sleep(Duration::from_millis(500));
-        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts")
-            && mounts.lines().any(|line| line.contains(mount_point))
-        {
-            eprintln!("Mount ready after {}ms", (i + 1) * 500);
-            return child;
-        }
-    }
-
-    eprintln!("Warning: mount may not be ready after 15s");
+    wait_for_mount_ready(&mut child, mount_point, "hf-mount-fuse");
     child
 }
 
@@ -352,7 +342,7 @@ pub fn mount_repo(repo_id: &str, mount_point: &str, cache_dir: &str, extra_args:
     if let Some(ref t) = token {
         cmd.args(["--hf-token", t]);
     }
-    let child = cmd
+    let mut child = cmd
         .args([
             "--hub-endpoint",
             &ep,
@@ -366,17 +356,7 @@ pub fn mount_repo(repo_id: &str, mount_point: &str, cache_dir: &str, extra_args:
         .spawn()
         .expect("Failed to spawn hf-mount-fuse");
 
-    for i in 0..30 {
-        std::thread::sleep(Duration::from_millis(500));
-        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts")
-            && mounts.lines().any(|line| line.contains(mount_point))
-        {
-            eprintln!("Mount ready after {}ms", (i + 1) * 500);
-            return child;
-        }
-    }
-
-    eprintln!("Warning: mount may not be ready after 15s");
+    wait_for_mount_ready(&mut child, mount_point, "hf-mount-fuse");
     child
 }
 
@@ -402,7 +382,7 @@ pub fn mount_bucket_nfs(bucket_id: &str, mount_point: &str, cache_dir: &str, ext
     std::fs::create_dir_all(cache_dir).ok();
 
     let ep = endpoint();
-    let child = Command::new(binary)
+    let mut child = Command::new(binary)
         .env(
             "RUST_LOG",
             std::env::var("RUST_LOG").unwrap_or_else(|_| "hf_mount=warn".to_string()),
@@ -422,36 +402,76 @@ pub fn mount_bucket_nfs(bucket_id: &str, mount_point: &str, cache_dir: &str, ext
         .spawn()
         .expect("Failed to spawn hf-mount-nfs");
 
+    wait_for_mount_ready(&mut child, mount_point, "hf-mount-nfs");
+    child
+}
+
+fn wait_for_mount_ready(child: &mut Child, mount_point: &str, process_name: &str) {
     for i in 0..30 {
         std::thread::sleep(Duration::from_millis(500));
-        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts")
-            && mounts.lines().any(|line| line.contains(mount_point))
-        {
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("{process_name} exited before mount became ready: {status}");
+        }
+        if mount_table_contains(mount_point) && std::fs::metadata(mount_point).is_ok() {
             eprintln!("Mount ready after {}ms", (i + 1) * 500);
-            return child;
+            return;
         }
     }
 
     eprintln!("Warning: mount may not be ready after 15s");
-    child
+}
+
+fn mount_table_contains(mount_point: &str) -> bool {
+    let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+        return false;
+    };
+    mounts
+        .lines()
+        .any(|line| line.split_whitespace().nth(1) == Some(mount_point))
 }
 
 /// Unmount FUSE and wait for hf-mount to exit. Waits up to `graceful_secs`
 /// for a clean exit (destroy() may flush + upload) before force-killing.
 pub fn unmount(mount_point: &str, child: Child, graceful_secs: u64) {
-    unmount_with(mount_point, child, graceful_secs, &["fusermount", "-u"]);
+    unmount_with(
+        mount_point,
+        child,
+        graceful_secs,
+        &[
+            &["fusermount3", "-u"],
+            &["fusermount", "-u"],
+            &["umount"],
+            &["fusermount3", "-u", "-z"],
+            &["fusermount", "-u", "-z"],
+            &["umount", "-l"],
+        ],
+    );
 }
 
 /// Unmount NFS and wait for hf-mount to exit.
 pub fn unmount_nfs(mount_point: &str, child: Child, graceful_secs: u64) {
-    unmount_with(mount_point, child, graceful_secs, &["sudo", "umount"]);
+    unmount_with(mount_point, child, graceful_secs, &[&["sudo", "umount"]]);
 }
 
-fn unmount_with(mount_point: &str, mut child: Child, graceful_secs: u64, cmd: &[&str]) {
-    match Command::new(cmd[0]).args(&cmd[1..]).arg(mount_point).status() {
-        Ok(s) if !s.success() => eprintln!("Warning: unmount command exited with {}", s),
-        Err(e) => eprintln!("Warning: unmount command failed: {}", e),
-        _ => {}
+fn unmount_with(mount_point: &str, mut child: Child, graceful_secs: u64, commands: &[&[&str]]) {
+    let mut unmounted = false;
+    for cmd in commands {
+        match Command::new(cmd[0]).args(&cmd[1..]).arg(mount_point).status() {
+            Ok(status) if status.success() => {
+                unmounted = true;
+                break;
+            }
+            Ok(status) => eprintln!("Warning: {} exited with {}", cmd.join(" "), status),
+            Err(e) => eprintln!("Warning: {} failed: {}", cmd.join(" "), e),
+        }
+        if !mount_table_contains(mount_point) {
+            unmounted = true;
+            break;
+        }
+    }
+
+    if !unmounted {
+        eprintln!("Warning: all unmount commands failed for {mount_point}");
     }
 
     for _ in 0..graceful_secs {

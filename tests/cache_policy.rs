@@ -237,7 +237,7 @@ fn mount_repo(binary: &Path, mount_point: &Path, cache_dir: &Path, extra_args: &
         command.args(["--hf-token", &token]);
     }
 
-    let child = command
+    let mut child = command
         .args([
             "--hub-endpoint",
             &endpoint,
@@ -255,7 +255,7 @@ fn mount_repo(binary: &Path, mount_point: &Path, cache_dir: &Path, extra_args: &
         .spawn()
         .expect("spawn hf-mount-fuse");
 
-    wait_for_mount(mount_point);
+    wait_for_mount(mount_point, &mut child);
     child
 }
 
@@ -293,17 +293,27 @@ fn read_at(path: &Path, offset: u64) -> Result<(), String> {
     }
 }
 
-fn wait_for_mount(mount_point: &Path) {
+fn wait_for_mount(mount_point: &Path, child: &mut Child) {
     let mount_point = mount_point.to_string_lossy();
     for _ in 0..60 {
-        if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
-            if mounts.lines().any(|line| line.contains(mount_point.as_ref())) {
-                return;
-            }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("hf-mount-fuse exited before mount became ready: {status}");
+        }
+        if mount_table_contains(mount_point.as_ref()) && fs::metadata(mount_point.as_ref()).is_ok() {
+            return;
         }
         std::thread::sleep(Duration::from_millis(500));
     }
     panic!("mount point {mount_point} did not appear in /proc/mounts");
+}
+
+fn mount_table_contains(mount_point: &str) -> bool {
+    let Ok(mounts) = fs::read_to_string("/proc/mounts") else {
+        return false;
+    };
+    mounts
+        .lines()
+        .any(|line| line.split_whitespace().nth(1) == Some(mount_point))
 }
 
 fn wait_for_cache_settle(cache_dir: &Path, min_entries: usize) -> Result<BTreeMap<PathBuf, u64>, String> {
@@ -488,7 +498,14 @@ impl Drop for MountGuard {
 }
 
 fn unmount(mount_point: &Path) {
-    let commands: &[(&str, &[&str])] = &[("fusermount", &["-u"]), ("fusermount3", &["-u"]), ("umount", &[])];
+    let commands: &[(&str, &[&str])] = &[
+        ("fusermount3", &["-u"]),
+        ("fusermount", &["-u"]),
+        ("umount", &[]),
+        ("fusermount3", &["-u", "-z"]),
+        ("fusermount", &["-u", "-z"]),
+        ("umount", &["-l"]),
+    ];
 
     for (cmd, args) in commands {
         if let Ok(status) = Command::new(cmd).args(*args).arg(mount_point).status() {
